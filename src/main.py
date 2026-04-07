@@ -29,6 +29,7 @@ from src.retriever import (
 )
 from src.ranking.reranker import rerank
 from src.cache import get_cache
+from src.memory_tracker import MemoryTracker
 
 ANSWER_NOT_FOUND = "I'm sorry, but I don't have enough information to answer that question."
 
@@ -376,11 +377,16 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
     console = Console()
 
     print("Initializing TokenSmith Chat...")
+    tracker = MemoryTracker()
     try:
         artifacts_dir = cfg.get_artifacts_directory(partial=args.partial)
         cfg.page_to_chunk_map_path = cfg.get_page_to_chunk_map_path(artifacts_dir, args.index_prefix)
-        faiss_idx, bm25_idx, chunks, sources, meta = load_artifacts(artifacts_dir, args.index_prefix)
+        faiss_idx, bm25_idx, chunks, sources, meta = tracker.track_load(
+            args.index_prefix,
+            lambda: load_artifacts(artifacts_dir, args.index_prefix)
+        )
         print(f"Loaded {len(chunks)} chunks and {len(sources)} sources from artifacts.")
+        print(f"Index memory footprint: {tracker.get_entry_mb(args.index_prefix):.1f} MB")
         retrievers = [FAISSRetriever(faiss_idx, cfg.embed_model), BM25Retriever(bm25_idx)]
         if cfg.ranker_weights.get("index_keywords", 0) > 0:
             retrievers.append(IndexKeywordRetriever(cfg.extracted_index_path, cfg.page_to_chunk_map_path))
