@@ -386,6 +386,24 @@ def get_keywords(question: str) -> list:
     keywords = [word.strip('.,!?()[]') for word in words if word not in stopwords]
     return keywords
 
+def _load_course_artifacts(course_name, artifacts_dir, index_prefix, cfg, tracker):
+    """Load index artifacts for a course, tracking memory usage."""
+    print(f"Loading index for '{course_name}'...")
+    faiss_idx, bm25_idx, chunks, sources, meta = tracker.track_load(
+        course_name,
+        lambda: load_artifacts(artifacts_dir, index_prefix)
+    )
+    print(f"Loaded {len(chunks)} chunks and {len(sources)} sources from '{course_name}'.")
+    print(f"Index memory footprint: {tracker.get_entry_mb(course_name):.1f} MB")
+
+    retrievers = [FAISSRetriever(faiss_idx, cfg.embed_model), BM25Retriever(bm25_idx)]
+    if cfg.ranker_weights.get("index_keywords", 0) > 0:
+        retrievers.append(IndexKeywordRetriever(cfg.extracted_index_path, cfg.page_to_chunk_map_path))
+
+    ranker = EnsembleRanker(ensemble_method=cfg.ensemble_method, weights=cfg.ranker_weights, rrf_k=int(cfg.rrf_k))
+    return {"chunks": chunks, "sources": sources, "retrievers": retrievers, "ranker": ranker, "meta": meta}
+
+
 def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
     logger = get_logger()
     console = Console()
@@ -407,38 +425,22 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
     if available:
         print(f"Available courses: {', '.join(available)}")
 
-    try:
-        # Resolve which index to load: --course flag, then --index_prefix fallback
-        if args.course and args.course in registry:
-            entry = registry.get(args.course)
-            artifacts_dir = entry.artifacts_path
-            index_prefix = entry.index_prefix
-            course_name = args.course
-        else:
-            artifacts_dir = cfg.get_artifacts_directory()
-            index_prefix = args.index_prefix
-            course_name = args.course or args.index_prefix
+    # Resolve which index to use (but don't load yet)
+    if args.course and args.course in registry:
+        entry = registry.get(args.course)
+        artifacts_dir = entry.artifacts_path
+        index_prefix = entry.index_prefix
+        course_name = args.course
+    else:
+        artifacts_dir = cfg.get_artifacts_directory()
+        index_prefix = args.index_prefix
+        course_name = args.course or args.index_prefix
 
-        faiss_idx, bm25_idx, chunks, sources, meta = tracker.track_load(
-            course_name,
-            lambda: load_artifacts(artifacts_dir, index_prefix)
-        )
-        print(f"Loaded {len(chunks)} chunks and {len(sources)} sources from '{course_name}'.")
-        print(f"Index memory footprint: {tracker.get_entry_mb(course_name):.1f} MB")
-        retrievers = [FAISSRetriever(faiss_idx, cfg.embed_model), BM25Retriever(bm25_idx)]
-        if cfg.ranker_weights.get("index_keywords", 0) > 0:
-            retrievers.append(IndexKeywordRetriever(cfg.extracted_index_path, cfg.page_to_chunk_map_path))
-        
-        ranker = EnsembleRanker(ensemble_method=cfg.ensemble_method, weights=cfg.ranker_weights, rrf_k=int(cfg.rrf_k))
-        print("Loaded retrievers and initialized ranker.")
-        artifacts = {"chunks": chunks, "sources": sources, "retrievers": retrievers, "ranker": ranker, "meta": meta}
-    except Exception as e:
-        print(f"ERROR: {e}. Run 'index' mode first.")
-        sys.exit(1)
+    artifacts = None  # lazy — loaded on first query
 
     chat_history = []
     additional_log_info = {}
-    print("Initialization complete. You can start asking questions!")
+    print("Ready. You can start asking questions!")
     print("Type 'exit' or 'quit' to end the session.")
     while True:
         print("CHAT HISTORY:", chat_history)  # Debug print to trace chat history
@@ -449,7 +451,17 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
             if q.lower() in {"exit", "quit"}:
                 print("Goodbye!")
                 break
-            
+
+            # Lazy load: first query triggers index loading
+            if artifacts is None:
+                try:
+                    artifacts = _load_course_artifacts(
+                        course_name, artifacts_dir, index_prefix, cfg, tracker
+                    )
+                except Exception as e:
+                    print(f"ERROR: {e}. Run 'index' mode first.")
+                    sys.exit(1)
+
             effective_q = q
             if cfg.enable_history and chat_history:
                 try:
@@ -462,7 +474,7 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                 except Exception as e:
                     print(f"Warning: Failed to contextualize query: {e}. Using original query.")
                     effective_q = q
-            
+
             # Use the single query function. get_answer also renders the streaming markdown and takes care of logging, so we need not do anything else here.
             ans = get_answer(effective_q, cfg, args, logger, console, artifacts=artifacts, additional_log_info=additional_log_info)
 
