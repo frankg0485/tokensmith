@@ -30,6 +30,7 @@ from src.retriever import (
 from src.ranking.reranker import rerank
 from src.cache import get_cache
 from src.memory_tracker import MemoryTracker
+from src.index_registry import IndexRegistry
 
 ANSWER_NOT_FOUND = "I'm sorry, but I don't have enough information to answer that question."
 
@@ -44,6 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_path", help="path to generation model")
     parser.add_argument("--system_prompt_mode", choices=["baseline", "tutor", "concise", "detailed"], default="baseline")
     
+    parser.add_argument("--course", default=None, help="course name for index registry (e.g. 'databases')")
+
     indexing_group = parser.add_argument_group("indexing options")
     indexing_group.add_argument("--keep_tables", action="store_true")
     indexing_group.add_argument("--multiproc_indexing", action="store_true")
@@ -89,6 +92,17 @@ def run_index_mode(args: argparse.Namespace, cfg: RAGConfig):
         use_headings=args.embed_with_headings,
         chapters_to_index=args.chapters,
     )
+
+    # Register in index registry
+    course = args.course or args.index_prefix
+    registry = IndexRegistry()
+    registry.register(
+        course=course,
+        artifacts_dir=str(artifacts_dir),
+        index_prefix=args.index_prefix,
+        pdf_dir=args.pdf_dir,
+    )
+    print(f"Registered index as course '{course}'.")
 
 def run_add_chapters_mode(args: argparse.Namespace, cfg: RAGConfig):
     """Handles the logic for adding chapters to an existing index."""
@@ -378,15 +392,39 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
 
     print("Initializing TokenSmith Chat...")
     tracker = MemoryTracker()
-    try:
-        artifacts_dir = cfg.get_artifacts_directory(partial=args.partial)
-        cfg.page_to_chunk_map_path = cfg.get_page_to_chunk_map_path(artifacts_dir, args.index_prefix)
-        faiss_idx, bm25_idx, chunks, sources, meta = tracker.track_load(
-            args.index_prefix,
-            lambda: load_artifacts(artifacts_dir, args.index_prefix)
+    registry = IndexRegistry()
+
+    # Auto-discover any unregistered indices
+    for entry in registry.discover():
+        registry.register(
+            course=entry.course,
+            artifacts_dir=entry.artifacts_dir,
+            index_prefix=entry.index_prefix,
         )
-        print(f"Loaded {len(chunks)} chunks and {len(sources)} sources from artifacts.")
-        print(f"Index memory footprint: {tracker.get_entry_mb(args.index_prefix):.1f} MB")
+        print(f"Auto-registered discovered index: '{entry.course}'")
+
+    available = registry.list_courses()
+    if available:
+        print(f"Available courses: {', '.join(available)}")
+
+    try:
+        # Resolve which index to load: --course flag, then --index_prefix fallback
+        if args.course and args.course in registry:
+            entry = registry.get(args.course)
+            artifacts_dir = entry.artifacts_path
+            index_prefix = entry.index_prefix
+            course_name = args.course
+        else:
+            artifacts_dir = cfg.get_artifacts_directory()
+            index_prefix = args.index_prefix
+            course_name = args.course or args.index_prefix
+
+        faiss_idx, bm25_idx, chunks, sources, meta = tracker.track_load(
+            course_name,
+            lambda: load_artifacts(artifacts_dir, index_prefix)
+        )
+        print(f"Loaded {len(chunks)} chunks and {len(sources)} sources from '{course_name}'.")
+        print(f"Index memory footprint: {tracker.get_entry_mb(course_name):.1f} MB")
         retrievers = [FAISSRetriever(faiss_idx, cfg.embed_model), BM25Retriever(bm25_idx)]
         if cfg.ranker_weights.get("index_keywords", 0) > 0:
             retrievers.append(IndexKeywordRetriever(cfg.extracted_index_path, cfg.page_to_chunk_map_path))

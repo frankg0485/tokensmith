@@ -1,0 +1,14 @@
+[
+  {
+    "course": "python-distilled",
+    "artifacts_dir": "index/sections",
+    "index_prefix": "python_distilled",
+    "pdf_dir": "data/chapters/"
+  },
+  {
+    "course": "textbook_index",
+    "artifacts_dir": "index/sections",
+    "index_prefix": "textbook_index",
+    "pdf_dir": null
+  }
+]
