@@ -1,12 +1,12 @@
 [
   {
-    "course": "python-distilled",
+    "course": "python_distilled",
     "artifacts_dir": "index/sections",
     "index_prefix": "python_distilled",
-    "pdf_dir": "data/chapters/"
+    "pdf_dir": null
   },
   {
-    "course": "textbook_index",
+    "course": "databases",
     "artifacts_dir": "index/sections",
     "index_prefix": "textbook_index",
     "pdf_dir": null

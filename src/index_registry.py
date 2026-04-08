@@ -49,6 +49,16 @@ class IndexEntry:
             if not (d / f"{self.index_prefix}{suffix}").exists()
         ]
 
+    def disk_size_bytes(self) -> int:
+        """Total size of the 5 required artifact files on disk."""
+        d = self.artifacts_path
+        total = 0
+        for suffix in REQUIRED_SUFFIXES:
+            f = d / f"{self.index_prefix}{suffix}"
+            if f.exists():
+                total += f.stat().st_size
+        return total
+
 
 class IndexRegistry:
     """Discovers, stores, and looks up available course indices."""

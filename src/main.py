@@ -31,6 +31,7 @@ from src.ranking.reranker import rerank
 from src.cache import get_cache
 from src.memory_tracker import MemoryTracker
 from src.index_registry import IndexRegistry
+from src.session_manager import SessionManager
 
 ANSWER_NOT_FOUND = "I'm sorry, but I don't have enough information to answer that question."
 
@@ -46,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--system_prompt_mode", choices=["baseline", "tutor", "concise", "detailed"], default="baseline")
     
     parser.add_argument("--course", default=None, help="course name for index registry (e.g. 'databases')")
+    parser.add_argument("--budget_mb", type=float, default=None, help="memory budget in MB for loaded indices")
 
     indexing_group = parser.add_argument_group("indexing options")
     indexing_group.add_argument("--keep_tables", action="store_true")
@@ -386,15 +388,22 @@ def get_keywords(question: str) -> list:
     keywords = [word.strip('.,!?()[]') for word in words if word not in stopwords]
     return keywords
 
-def _load_course_artifacts(course_name, artifacts_dir, index_prefix, cfg, tracker):
+def _load_course_artifacts(course_name, artifacts_dir, index_prefix, cfg, tracker, disk_size_bytes=None):
     """Load index artifacts for a course, tracking memory usage."""
     print(f"Loading index for '{course_name}'...")
-    faiss_idx, bm25_idx, chunks, sources, meta = tracker.track_load(
-        course_name,
-        lambda: load_artifacts(artifacts_dir, index_prefix)
-    )
+    faiss_idx, bm25_idx, chunks, sources, meta = load_artifacts(artifacts_dir, index_prefix)
+
+    if disk_size_bytes is not None:
+        tracker.track(course_name, disk_size_bytes)
     print(f"Loaded {len(chunks)} chunks and {len(sources)} sources from '{course_name}'.")
-    print(f"Index memory footprint: {tracker.get_entry_mb(course_name):.1f} MB")
+    index_mb = tracker.get_entry_mb(course_name)
+    total_mb = tracker.tracked_usage_mb()
+    rss_mb = tracker.measure_rss() / (1024 * 1024)
+    if tracker.budget is not None:
+        budget_mb = tracker.budget / (1024 * 1024)
+        print(f"Index size: {index_mb:.1f} MB | Budget: {total_mb:.1f} / {budget_mb:.0f} MB | Process RSS: {rss_mb:.0f} MB")
+    else:
+        print(f"Index size: {index_mb:.1f} MB | Total tracked: {total_mb:.1f} MB | Process RSS: {rss_mb:.0f} MB")
 
     retrievers = [FAISSRetriever(faiss_idx, cfg.embed_model), BM25Retriever(bm25_idx)]
     if cfg.ranker_weights.get("index_keywords", 0) > 0:
@@ -425,42 +434,101 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
     if available:
         print(f"Available courses: {', '.join(available)}")
 
-    # Resolve which index to use (but don't load yet)
-    if args.course and args.course in registry:
-        entry = registry.get(args.course)
-        artifacts_dir = entry.artifacts_path
-        index_prefix = entry.index_prefix
-        course_name = args.course
-    else:
-        artifacts_dir = cfg.get_artifacts_directory()
-        index_prefix = args.index_prefix
-        course_name = args.course or args.index_prefix
+    # Build session manager with load function
+    def load_fn(course_name, entry):
+        return _load_course_artifacts(
+            course_name, str(entry.artifacts_path), entry.index_prefix, cfg, tracker,
+            disk_size_bytes=entry.disk_size_bytes(),
+        )
 
-    artifacts = None  # lazy — loaded on first query
+    session = SessionManager(
+        registry=registry,
+        tracker=tracker,
+        load_fn=load_fn,
+        budget_mb=args.budget_mb,
+    )
+
+    # Resolve initial course (but don't load yet — lazy)
+    if args.course and args.course in registry:
+        active_course = args.course
+    elif registry.list_courses():
+        active_course = registry.list_courses()[0]
+    else:
+        # Fallback: register the default index_prefix if it exists on disk
+        artifacts_dir = cfg.get_artifacts_directory()
+        course_name = args.index_prefix
+        try:
+            registry.register(
+                course=course_name,
+                artifacts_dir=str(artifacts_dir),
+                index_prefix=args.index_prefix,
+            )
+            active_course = course_name
+        except FileNotFoundError:
+            print("ERROR: No indices found. Run 'index' mode first.")
+            sys.exit(1)
+
+    if args.budget_mb:
+        print(f"Memory budget: {args.budget_mb:.0f} MB")
 
     chat_history = []
     additional_log_info = {}
     print("Ready. You can start asking questions!")
-    print("Type 'exit' or 'quit' to end the session.")
+    print("Commands: /switch <course>, /status, /courses, exit")
     while True:
         print("CHAT HISTORY:", chat_history)  # Debug print to trace chat history
         try:
-            q = input("\nAsk > ").strip()
+            prompt_course = session.active_course or active_course
+            q = input(f"\n[{prompt_course}] Ask > ").strip()
             if not q:
                 continue
             if q.lower() in {"exit", "quit"}:
                 print("Goodbye!")
                 break
 
+            # Handle session commands
+            if q.startswith("/"):
+                parts = q.split(maxsplit=1)
+                cmd = parts[0].lower()
+
+                if cmd == "/switch":
+                    if len(parts) < 2:
+                        print(f"Usage: /switch <course>")
+                        print(f"Available: {', '.join(registry.list_courses())}")
+                        continue
+                    target = parts[1].strip()
+                    if target not in registry:
+                        print(f"Unknown course '{target}'. Available: {', '.join(registry.list_courses())}")
+                        continue
+                    try:
+                        session.get_or_load(target)
+                        active_course = target
+                        chat_history = []  # reset history on course switch
+                        print(f"Switched to '{target}'.")
+                    except Exception as e:
+                        print(f"Failed to switch: {e}")
+                    continue
+
+                elif cmd == "/status":
+                    session.status()
+                    continue
+
+                elif cmd == "/courses":
+                    print(f"Available: {', '.join(registry.list_courses())}")
+                    print(f"Loaded: {', '.join(session.loaded_courses()) or '(none)'}")
+                    continue
+
+                else:
+                    print(f"Unknown command: {cmd}")
+                    print("Commands: /switch <course>, /status, /courses")
+                    continue
+
             # Lazy load: first query triggers index loading
-            if artifacts is None:
-                try:
-                    artifacts = _load_course_artifacts(
-                        course_name, artifacts_dir, index_prefix, cfg, tracker
-                    )
-                except Exception as e:
-                    print(f"ERROR: {e}. Run 'index' mode first.")
-                    sys.exit(1)
+            try:
+                artifacts = session.get_or_load(active_course)
+            except Exception as e:
+                print(f"ERROR: {e}. Run 'index' mode first.")
+                sys.exit(1)
 
             effective_q = q
             if cfg.enable_history and chat_history:

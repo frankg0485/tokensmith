@@ -1,8 +1,9 @@
 """
 memory_tracker.py
 
-Tracks memory footprint of indices using process-level RSS measurement.
-FAISS indices' memory footbprint can't be tracked by python-level tools.
+Tracks memory footprint of loaded indices. Uses file-based sizing (sum of
+artifact files on disk) for deterministic, repeatable measurements. RSS
+diffing is available as a secondary tool but not used for budget decisions.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional
 
 import psutil
 
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryTracker:
-    """Measures and tracks per-resource memory usage via RSS diffing."""
+    """Tracks per-resource memory usage for budget enforcement."""
 
     def __init__(self, budget_mb: Optional[float] = None):
         self._process = psutil.Process(os.getpid())
@@ -27,27 +28,22 @@ class MemoryTracker:
             int(budget_mb * 1024 * 1024) if budget_mb is not None else None
         )
 
-    # ---- measurement ----
+    # ---- tracking ----
 
-    def measure_rss(self) -> int:
-        """Current process RSS in bytes."""
-        return self._process.memory_info().rss
-
-    def track_load(self, name: str, load_fn: Callable[[], Any]) -> Any:
-        """Call *load_fn*, measure its memory cost, return its result."""
-        gc.collect()
-        before = self.measure_rss()
-        result = load_fn()
-        gc.collect()
-        after = self.measure_rss()
-        cost = max(after - before, 0)
-        self._entries[name] = cost
-        logger.info("Loaded '%s': %.1f MB", name, cost / (1024 * 1024))
-        return result
+    def track(self, name: str, size_bytes: int):
+        """Record a known size for a named resource."""
+        self._entries[name] = size_bytes
+        logger.info("Tracking '%s': %.1f MB", name, size_bytes / (1024 * 1024))
 
     def track_unload(self, name: str) -> int:
         """Remove *name* from tracking and return its recorded size."""
         return self._entries.pop(name, 0)
+
+    # ---- RSS (informational, not used for budget) ----
+
+    def measure_rss(self) -> int:
+        """Current process RSS in bytes."""
+        return self._process.memory_info().rss
 
     # ---- queries ----
 
