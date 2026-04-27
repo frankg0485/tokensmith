@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     
     parser.add_argument("--course", default=None, help="course name for index registry (e.g. 'databases')")
     parser.add_argument("--budget_mb", type=float, default=None, help="memory budget in MB for loaded indices")
+    parser.add_argument("--eviction_policy", choices=["lru", "2q"], default="lru", help="eviction policy (lru or 2q)")
 
     indexing_group = parser.add_argument_group("indexing options")
     indexing_group.add_argument("--keep_tables", action="store_true")
@@ -446,6 +447,7 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
         tracker=tracker,
         load_fn=load_fn,
         budget_mb=args.budget_mb,
+        policy=args.eviction_policy,
     )
 
     # Resolve initial course (but don't load yet — lazy)
@@ -469,7 +471,7 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
             sys.exit(1)
 
     if args.budget_mb:
-        print(f"Memory budget: {args.budget_mb:.0f} MB")
+        print(f"Memory budget: {args.budget_mb:.0f} MB | Eviction policy: {args.eviction_policy}")
 
     chat_history = []
     additional_log_info = {}
