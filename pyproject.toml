@@ -24,6 +24,7 @@ include = ["src*"]
 [tool.pytest.ini_options]
 markers = [
     "unit: Unit tests for API compatibility (run with: pytest -m unit)",
+    "session: Session manager evaluation tests (run with: pytest -m session)",
 ]
 testpaths = ["tests"]
 
